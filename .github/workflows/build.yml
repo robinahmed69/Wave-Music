@@ -1,0 +1,109 @@
+name: Build APK from uploaded ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Extract source and build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository (contains uploaded ZIP)
+        uses: actions/checkout@v7
+
+      - name: Find and extract project ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "No .zip file found in the repository root. Upload the project ZIP first."
+            exit 1
+          fi
+          if [ "${#zips[@]}" -gt 1 ]; then
+            echo "More than one ZIP found in the repository root. Keep only the intended project ZIP."
+            printf ' - %s\n' "${zips[@]}"
+            exit 1
+          fi
+          mkdir -p _source
+          unzip -q "${zips[0]}" -d _source
+          mapfile -t wrappers < <(find _source -type f -name gradlew -not -path '*/.gradle/*')
+          if [ "${#wrappers[@]}" -ne 1 ]; then
+            echo "Expected exactly one gradlew in the ZIP, found ${#wrappers[@]}."
+            exit 1
+          fi
+          project_dir="$(dirname "${wrappers[0]}")"
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          chmod +x "$project_dir/gradlew"
+          echo "Using project directory: $project_dir"
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" > /dev/null
+
+      - name: Set up Rust Android targets
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target aarch64-linux-android --target armv7-linux-androideabi
+          rustup default stable
+
+      - name: Cache Rust and Bungee dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-ndk
+            ${{ steps.source.outputs.project_dir }}/native/target
+            ${{ steps.source.outputs.project_dir }}/native-dsp/bungee
+          key: wave-${{ runner.os }}-${{ hashFiles('**/native/Cargo.lock', '**/native/vendor/**', '**/native/src/**', '**/app/build.gradle.kts') }}
+          restore-keys: wave-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        shell: bash
+        run: command -v cargo-ndk > /dev/null || cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set build version
+        shell: bash
+        run: |
+          echo "VC=$((100 + ${{ github.run_number }}))" >> "$GITHUB_ENV"
+          echo "VER=2.8.$((100 + ${{ github.run_number }}))" >> "$GITHUB_ENV"
+
+      - name: Build universal APK
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: ./gradlew :app:assembleDev -Pvc="$VC" -Pvn="$VER" --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wave-${{ env.VER }}-APK
+          path: ${{ steps.source.outputs.project_dir }}/app/build/outputs/apk/dev/app-universal-dev.apk
+          if-no-files-found: error
+          retention-days: 14
